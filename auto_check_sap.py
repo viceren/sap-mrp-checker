@@ -16,7 +16,7 @@ from captcha_solver_v2 import ArithmeticCaptchaSolverV2
 
 # ========== 从 .env 加载配置 ==========
 def load_env():
-    """从 .env 文件加载环境变量 (不覆盖已有环境变量)"""
+    """从 .env 文件加载环境变量 (强制覆盖, 因为 Windows 系统环境变量可能有 USERNAME)"""
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
         with open(env_path, encoding="utf-8") as f:
@@ -25,8 +25,8 @@ def load_env():
                 if line and not line.startswith("#") and "=" in line:
                     key, _, val = line.partition("=")
                     key, val = key.strip(), val.strip()
-                    if key and key not in os.environ:
-                        os.environ[key] = val
+                    if key:
+                        os.environ[key] = val  # 强制覆盖
 
 load_env()
 
@@ -56,7 +56,9 @@ log = logging.getLogger("auto_check")
 # ============================================================
 
 def solve_and_login(page, max_retries=MAX_LOGIN_RETRIES):
-    """自动登录: 获取验证码→求解→填表单→提交→重试"""
+    """自动登录: 获取验证码→求解→填表单→提交→重试
+    每次只提交一个答案, 失败则刷新验证码重试
+    """
     solver = ArithmeticCaptchaSolverV2()
 
     for attempt in range(max_retries):
@@ -84,7 +86,8 @@ def solve_and_login(page, max_retries=MAX_LOGIN_RETRIES):
                 continue
 
             ver = result["answer"]
-            log.info(f"[{attempt+1}] 验证码={ver} (方法={result['method'][:40]}, 置信度={result['confidence']})")
+            candidates = result.get("candidates", [ver])
+            log.info(f"[{attempt+1}] 验证码={ver} (候选={candidates}, 方法={result['method'][:40]}, 置信度={result['confidence']})")
 
             # 填写登录表单
             inputs = page.query_selector_all("input.el-input__inner")
@@ -95,7 +98,7 @@ def solve_and_login(page, max_retries=MAX_LOGIN_RETRIES):
 
             inputs[0].fill(USERNAME)
             inputs[1].fill(PASSWORD)
-            inputs[2].fill(ver)
+            inputs[2].fill(str(ver))
 
             # 提交
             login_btns = page.query_selector_all("button.el-button--primary")
@@ -107,9 +110,10 @@ def solve_and_login(page, max_retries=MAX_LOGIN_RETRIES):
 
             # 判断登录是否成功
             if "login" not in page.url.lower():
-                log.info(f"[OK] 第{attempt+1}次尝试登录成功!")
+                log.info(f"[OK] 第{attempt+1}次尝试登录成功! 验证码={ver}")
                 return True
 
+            # 失败 → 刷新验证码重试
             _refresh_captcha(page)
             page.wait_for_timeout(1000)
 
