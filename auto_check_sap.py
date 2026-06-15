@@ -8,18 +8,34 @@ API: GET /evods/trans/op/xlog/listPage
 """
 import os, sys, io, base64, time, json, logging, re
 from datetime import datetime, timedelta
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from captcha_solver_v2 import ArithmeticCaptchaSolverV2
 
-# ========== 配置 ==========
-BASE_URL = "http://192.168.220.90:8081"
-API_BASE = "http://192.168.220.90:9998"
-USERNAME = "admin"
-PASSWORD = "Admin12345"
-TARGET_TASK = "sap-mrp-main"
-MAX_LOGIN_RETRIES = 20
+# ========== 从 .env 加载配置 ==========
+def load_env():
+    """从 .env 文件加载环境变量 (不覆盖已有环境变量)"""
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    key, val = key.strip(), val.strip()
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+
+load_env()
+
+BASE_URL = os.environ.get("BASE_URL", "http://192.168.220.90:8081")
+API_BASE = os.environ.get("API_BASE", "http://192.168.220.90:9998")
+USERNAME = os.environ.get("USERNAME", "admin")
+PASSWORD = os.environ.get("PASSWORD", "")
+TARGET_TASK = os.environ.get("TARGET_TASK", "sap-mrp-main")
+MAX_LOGIN_RETRIES = int(os.environ.get("MAX_LOGIN_RETRIES", "20"))
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(OUT_DIR, "auto_check.log")

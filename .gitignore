@@ -6,3 +6,4 @@ __pycache__/
 report_*.txt
 需求说明.txt
 .workbuddy/
+.env
