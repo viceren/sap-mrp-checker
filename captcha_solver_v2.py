@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-算术验证码求解器 v3
+算术验证码求解器 v4 (v3 + 形态学+特征识别优化)
 支持: 加(+)、减(-)、乘(×)、除(÷) 四则运算
 
-核心策略:
+核心策略 (v3原有):
 1. 红色通道提取 + 干扰线去除
 2. 固定位置分割: 数字1(x≈25-55) | 运算符(x≈45-68) | 数字2(x≈63-95) | =?(x≈88-128)
 3. 运算符模板匹配 (基于像素特征区分 +、-、×、÷)
 4. 多策略OCR + 加权投票
 5. 整数结果约束 (÷需整除, ×结果0-81, ±结果合理范围)
+
+v4新增优化:
+6. 形态学预处理: 开运算去噪 + 闭运算连断裂笔画
+7. 数字像素特征识别器: 基于0-9的宽高比/密度/对称性/连通域/空洞数做模板匹配
+8. 改进投票机制: 多独立策略一致时大幅提升置信度(+0.15/策略,最高+0.4)
+9. OCR与特征识别交叉验证: 对0/1/8等易混淆数字优先信任特征识别
 """
 import io, re, base64, logging, math
 from PIL import Image, ImageFilter, ImageDraw
@@ -82,6 +88,24 @@ class ArithmeticCaptchaSolverV2:
             if px < 5 and w < 5 and h < 5:
                 clean[cmask] = False
         return clean
+
+    def _morphological_clean(self, mask):
+        """
+        形态学预处理: 开运算去噪 + 闭运算连笔
+        开运算 (先腐蚀后膨胀) → 去除小噪点和细干扰线
+        闭运算 (先膨胀后腐蚀) → 连接断裂的笔画
+        """
+        # 用 scipy 的 binary_erosion/dilation 实现
+        # 结构元素: 3x3 十字型
+        struct = ndimage.generate_binary_structure(2, 1)  # cross-shaped
+
+        # 开运算: 先腐蚀再膨胀 → 去除小噪点
+        opened = ndimage.binary_dilation(ndimage.binary_erosion(mask, structure=struct), structure=struct)
+
+        # 闭运算: 再膨胀再腐蚀 → 连接断裂笔画
+        closed = ndimage.binary_erosion(ndimage.binary_dilation(opened, structure=struct), structure=struct)
+
+        return closed
 
     def _mask_to_image(self, mask, scale=3):
         """二值掩码 → PIL灰度图 (放大scale倍)"""
@@ -359,6 +383,221 @@ class ArithmeticCaptchaSolverV2:
         
         return None
 
+    # ========== 数字像素特征识别器 (v3新增) ==========
+
+    def _classify_digit_by_features(self, mask, x1, x2, y1=8, y2=48):
+        """
+        基于像素特征的数字分类器 (0-9)
+        作为OCR的补充/验证手段
+        利用: 连通域数量、宽高比、上中下三段密度、中心对称性等
+        """
+        H, W = mask.shape
+        rx1 = max(0, x1 - 2)
+        rx2 = min(W - 1, x2 + 2)
+        ry1 = max(0, y1)
+        ry2 = min(H - 1, y2)
+        sub = mask[ry1:ry2 + 1, rx1:rx2 + 1]
+
+        if sub.sum() < 5:
+            return None
+
+        sh, sw = sub.shape
+
+        # 提取特征
+        total_px = int(sub.sum())
+        if total_px < 3:
+            return None
+
+        # 找边界框 (去除空白后)
+        rows_with_px = np.where(sub.any(axis=1))[0]
+        cols_with_px = np.where(sub.any(axis=0))[0]
+        if len(rows_with_px) == 0 or len(cols_with_px) == 0:
+            return None
+
+        top_r, bot_r = rows_with_px[0], rows_with_px[-1]
+        l_c, r_c = cols_with_px[0], cols_with_px[-1]
+        char_h = bot_r - top_r + 1
+        char_w = r_c - l_c + 1
+
+        # 宽高比
+        aspect_ratio = char_w / max(char_h, 1)
+
+        # 三段密度 (上/中/下各占1/3)
+        h_third = max(char_h // 3, 1)
+        top_density = sub[top_r:min(top_r + h_third, bot_r + 1), :].sum() if top_r <= bot_r else 0
+        mid_density = sub[min(top_r + h_third, bot_r):min(top_r + 2 * h_third, bot_r + 1), :].sum()
+        bot_density = sub[min(top_r + 2 * h_third, bot_r):bot_r + 1, :].sum() if top_r <= bot_r else 0
+
+        # 左右密度 (各半)
+        w_half = max(char_w // 2, 1)
+        left_density = sub[:, l_c:min(l_c + w_half, r_c + 1)].sum() if l_c <= r_c else 0
+        right_density = sub[:, min(l_c + w_half, r_c):r_c + 1].sum() if l_c <= r_c else 0
+
+        # 水平中心线像素 (中间行)
+        mid_row_idx = (top_r + bot_r) // 2
+        center_row_px = int(sub[mid_row_idx - ry1, :].sum()) if 0 <= mid_row_idx - ry1 < sh else 0
+
+        # 垂直中心线像素 (中间列)
+        mid_col_idx = (l_c + r_c) // 2
+        center_col_px = int(sub[:, mid_col_idx - rx1].sum()) if 0 <= mid_col_idx - rx1 < sw else 0
+
+        # 上下对称性
+        symmetry_v = 1.0 - abs(top_density - bot_density) / max(total_px, 1)
+
+        # 左右对称性
+        symmetry_h = 1.0 - abs(left_density - right_density) / max(total_px, 1)
+
+        # 连通域数量
+        labeled_sub, n_labels = ndimage.label(sub)
+
+        # 空洞数 (内部空白连通域, 不接触图像边缘的独立区域)
+        inverted = ~sub
+        inv_labeled, n_inv = ndimage.label(inverted)
+        # 检查每个反图连通域是否完全在内部(不触碰边界) = 洞
+        holes = 0
+        for i in range(1, n_inv + 1):
+            region_mask = (inv_labeled == i)
+            if not region_mask.any():
+                continue
+            # 如果区域不接触任何四边 → 是空洞
+            touches_edge = (region_mask[0, :].any() or region_mask[-1, :].any() or
+                           region_mask[:, 0].any() or region_mask[:, -1].any())
+            if not touches_edge:
+                holes += 1
+
+        # 上半部分是否有独立区域 (区分6/9 vs 8/0)
+        has_top_isolated = False
+        has_bot_isolated = False
+        for lbl in range(1, n_labels + 1):
+            region = labeled_sub == lbl
+            region_rows = np.where(region.any(axis=1))[0]
+            if len(region_rows) > 0 and region_rows[0] < (top_r + bot_r) // 2:
+                region_top = region_rows[0]
+                if region_top > top_r + char_h * 0.15:
+                    has_top_isolated = True
+            if len(region_rows) > 0 and region_rows[-1] > (top_r + bot_r) // 2:
+                region_bot = region_rows[-1]
+                if region_bot < top_r + char_h * 0.85:
+                    has_bot_isolated = True
+
+        # === 数字特征匹配 ===
+        scores = {}
+
+        for digit in range(10):
+            score = self._digit_feature_score(digit, {
+                'total_px': total_px, 'aspect': aspect_ratio, 'char_w': char_w, 'char_h': char_h,
+                'top_d': top_density, 'mid_d': mid_density, 'bot_d': bot_density,
+                'left_d': left_density, 'right_d': right_density,
+                'center_row': center_row_px, 'center_col': center_col_px,
+                'sym_v': symmetry_v, 'sym_h': symmetry_h,
+                'n_components': n_labels, 'holes': holes,
+                'has_top_iso': has_top_isolated, 'has_bot_iso': has_bot_isolated,
+            }, sh, sw)
+            if score > 0:
+                scores[digit] = score
+
+        if not scores:
+            return None
+
+        best_digit = max(scores, key=scores.get)
+        logger.debug(f"  [特征识别] digit={best_digit} (scores={dict((d, round(s,2)) for d,s in sorted(scores.items(), key=lambda x:-x[1])[:3])})")
+        return best_digit if scores[best_digit] >= 0.25 else None
+
+    @staticmethod
+    def _digit_feature_score(digit, feat, sh, sw):
+        """
+        计算数字 d 与给定特征的匹配得分 (0~1)
+        基于 160x60 验证码中手写体数字的典型特征
+        """
+        s = 0.0
+        a = feat['aspect']
+        t, m, b = feat['top_d'], feat['mid_d'], feat['bot_d']
+        sv, sh_ = feat['sym_v'], feat['sym_h']
+        nc = feat['n_components']
+        holes = feat['holes']
+
+        if digit == 0:
+            # 圆环: 高宽比接近1, 上下左右都对称, 有空洞
+            if 0.4 <= a <= 0.95: s += 0.20
+            if sv > 0.7 and sh_ > 0.65: s += 0.25
+            if holes >= 1: s += 0.30  # 内部有空洞是0的关键特征
+            if m > t * 0.6 and m > b * 0.6: s += 0.10  # 中间也有像素
+            if nc <= 3: s += 0.05
+            if t > 2 and b > 2: s += 0.08
+
+        elif digit == 1:
+            # 竖线: 很窄, 高宽比大
+            if a < 0.35: s += 0.35  # 最强特征
+            if a < 0.50: s += 0.15
+            if feat['char_h'] > 12: s += 0.15  # 较高
+            if nc <= 2: s += 0.15  # 通常一个或两个连通域
+            if feat['center_col'] > 3: s += 0.10  # 中间列有较多像素
+
+        elif digit == 2:
+            # 2字形: 上多下少, 不对称
+            if 0.35 <= a <= 0.85: s += 0.10
+            if t > b * 1.2: s += 0.25  # 上部更密
+            if sv < 0.55: s += 0.20  # 上下不对称
+            if nc <= 3: s += 0.10
+            if feat['right_d'] > feat['left_d'] * 0.7: s += 0.15  # 右侧有笔画
+
+        elif digit == 3:
+            # 3字形: 右侧密集, 上下都有
+            if 0.40 <= a <= 0.80: s += 0.10
+            if feat['right_d'] > feat['left_d']: s += 0.30  # 右偏
+            if t > 2 and b > 2: s += 0.20  # 上下都有
+            if sv > 0.45: s += 0.10  # 有一定对称性
+
+        elif digit == 4:
+            # 4字形: 开口向下, 上部较密, 中间有竖线
+            if 0.40 <= a <= 0.90: s += 0.10
+            if t > b * 1.3: s += 0.25  # 上部更密
+            if m > t * 0.5: s += 0.15  # 中间有竖线
+            if feat['center_col'] > 2: s += 0.10
+            if nc >= 2 and nc <= 4: s += 0.10
+
+        elif digit == 5:
+            # 5字形: 上横+下半圆, 左侧上部有
+            if 0.40 <= a <= 0.85: s += 0.10
+            if t > b * 0.8: s += 0.15  # 顶部有横
+            if feat['left_d'] > 2: s += 0.15  # 左侧有
+            if b > 2: s += 0.15  # 底部有圆弧
+            if sv < 0.60: s += 0.15  # 不太对称
+
+        elif digit == 6:
+            # 6字形: 下部圆, 顶部可能有小钩
+            if 0.40 <= a <= 0.85: s += 0.10
+            if b > t * 1.1: s += 0.20  # 下部更密
+            if feat['has_bot_iso']: s += 0.20  # 底部有封闭区域
+            if holes >= 1: s += 0.15  # 有空洞
+            if feat['left_d'] > feat['right_d'] * 0.5: s += 0.05
+
+        elif digit == 7:
+            # 7字形: 上横+斜线, 上密下稀
+            if 0.30 <= a <= 0.75: s += 0.10
+            if t > b * 1.5: s += 0.30  # 明显上重下轻
+            if sv < 0.40: s += 0.20  # 严重不对称
+            if feat['right_d'] > feat['left_d']: s += 0.10  # 斜向右
+
+        elif digit == 8:
+            # 8字形: 两个圈, 对称, 可能有2个空洞
+            if 0.40 <= a <= 0.85: s += 0.10
+            if sv > 0.70: s += 0.25  # 上下对称
+            if t > 2 and b > 2: s += 0.15  # 上下都有
+            if holes >= 1: s += 0.15  # 有空洞
+            if m > t * 0.5 and m > b * 0.5: s += 0.10  # 中间连接
+            if nc >= 2: s += 0.05
+
+        elif digit == 9:
+            # 9字形: 上部圆, 底部可能有小尾巴
+            if 0.40 <= a <= 0.85: s += 0.10
+            if t > b * 1.1: s += 0.20  # 上部更密
+            if feat['has_top_iso']: s += 0.20  # 顶部有封闭区域
+            if holes >= 1: s += 0.15  # 有空洞
+            if feat['right_d'] > feat['left_d'] * 0.5: s += 0.05
+
+        return min(s, 1.0)
+
     # ========== 四则运算解析 ==========
 
     def _parse_arithmetic(self, text):
@@ -479,11 +718,12 @@ class ArithmeticCaptchaSolverV2:
         arr, (W, H) = self._to_array(raw_image_bytes)
         all_candidates = []  # 收集所有候选结果用于投票
 
-        # ===== 策略1: 红色提取 + 全图OCR =====
+        # ===== 策略1: 红色提取 + 形态学增强 + 全图OCR =====
         for thresh_name in ["medium", "strict", "loose"]:
             mask = self._extract_red_mask(arr, thresh_name)
             clean_mask = self._remove_noise_lines(mask)
-            img = self._mask_to_image(clean_mask, scale=4)
+            morphed = self._morphological_clean(clean_mask)  # 形态学增强
+            img = self._mask_to_image(morphed, scale=4)
             img_bytes = self._image_to_bytes(img)
             candidates = self._ocr_image(img_bytes)
             logger.debug(f"  [策略1-{thresh_name}] OCR: {candidates}")
@@ -518,42 +758,68 @@ class ArithmeticCaptchaSolverV2:
                 all_candidates.append((ans, conf, f"binary_ocr:{text!r}"))
 
         # ===== 策略2: 固定位置分割 + 数字OCR (核心策略) =====
-        # 数字1: x≈22-55, 数字2: x≈58-98
+        # 数字1: x≈22-55, 数字2: x≈58-98 (自适应微调)
         best_digits = None
         for thresh_name in ["medium", "strict"]:
             mask = self._extract_red_mask(arr, thresh_name)
             clean_mask = self._remove_noise_lines(mask)
+            # 形态学预处理: 连断裂笔画、去噪点
+            morphed = self._morphological_clean(clean_mask)
 
-            d1 = self._ocr_digit(clean_mask, 22, 55)
-            d2 = self._ocr_digit(clean_mask, 58, 98)
+            d1_ocr = self._ocr_digit(morphed, 22, 55)
+            d2_ocr = self._ocr_digit(morphed, 58, 98)
+
+            # 特征识别作为补充/验证
+            d1_feat = self._classify_digit_by_features(morphed, 22, 55)
+            d2_feat = self._classify_digit_by_features(morphed, 58, 98)
+
+            # OCR优先, 特征识别作为验证/修正
+            d1 = d1_ocr if d1_ocr is not None else d1_feat
+            d2 = d2_ocr if d2_ocr is not None else d2_feat
+
+            # 如果OCR和特征识别结果不同且都有值, 用特征识别验证(特征识别对某些数字更准)
+            if d1_ocr is not None and d1_feat is not None and d1_ocr != d1_feat:
+                # 特征识别对数字1(竖线)、0(环形)、8(双圈)更可靠
+                reliable_digits = {0, 1, 8}
+                if d1_feat in reliable_digits:
+                    d1 = d1_feat  # 信任特征识别
+                    logger.debug(f"  digit1: ocr={d1_ocr} → feat={d1_feat} (trust feat)")
+            if d2_ocr is not None and d2_feat is not None and d2_ocr != d2_feat:
+                reliable_digits = {0, 1, 8}
+                if d2_feat in reliable_digits:
+                    d2 = d2_feat
+                    logger.debug(f"  digit2: ocr={d2_ocr} → feat={d2_feat} (trust feat)")
 
             if d1 is not None and d2 is not None:
                 best_digits = (d1, d2)
                 # 运算符识别 (仅用于排序候选优先级)
-                op_pixel, op_pixel_conf = self._identify_operator(clean_mask, arr)
-                op_ocr, op_ocr_conf = self._identify_operator_ocr(clean_mask)
-                
+                op_pixel, op_pixel_conf = self._identify_operator(morphed, arr)
+                op_ocr, op_ocr_conf = self._identify_operator_ocr(morphed)
+
                 identified_op = op_pixel if op_pixel_conf >= op_ocr_conf else op_ocr
                 op_conf = max(op_pixel_conf, op_ocr_conf)
-                
+
                 # 生成4种运算的候选, 按识别到的运算符优先
                 op_order = ['+', '-', '×', '÷']
                 if identified_op and identified_op in op_order:
                     op_order.remove(identified_op)
                     op_order.insert(0, identified_op)
-                
+
                 for try_op in op_order:
                     ans = self._compute(d1, d2, try_op)
                     if ans is not None and self._is_valid_result(d1, d2, ans):
-                        conf = 0.6 if try_op == identified_op else 0.35
-                        all_candidates.append((str(ans), conf, f"fixed_pos_ocr:{d1}{try_op}{d2}"))
+                        conf = 0.65 if try_op == identified_op else 0.38
+                        # 如果特征识别也确认了这两个数字, 额外加分
+                        feat_bonus = 0.05 if (d1_feat == d1 and d2_feat == d2) else 0
+                        all_candidates.append((str(ans), conf + feat_bonus, f"fixed_pos_morph:{d1}{try_op}{d2}"))
                 break  # 只要medium成功就不用strict
 
-        # ===== 策略3: 列投影分割 =====
+        # ===== 策略3: 列投影分割 + 形态学增强 =====
         for thresh_name in ["medium", "strict"]:
             mask = self._extract_red_mask(arr, thresh_name)
             clean_mask = self._remove_noise_lines(mask)
-            col_proj = self._column_projection(clean_mask)
+            morphed = self._morphological_clean(clean_mask)  # 形态学增强
+            col_proj = self._column_projection(morphed)
             regions = self._find_char_regions(col_proj)
 
             if len(regions) >= 3:
@@ -568,7 +834,7 @@ class ArithmeticCaptchaSolverV2:
 
                 digits_found = []
                 for _, xs, xe, _, _ in top2:
-                    crop_result = self._crop_region(clean_mask, xs, xe, padding=4)
+                    crop_result = self._crop_region(morphed, xs, xe, padding=4)
                     if crop_result is None:
                         continue
                     crop_mask, _ = crop_result
@@ -588,7 +854,7 @@ class ArithmeticCaptchaSolverV2:
                             op_conf = 0.5 if try_op == '+' else 0.35
                             all_candidates.append((str(ans), op_conf, f"segment_ocr({thresh_name}):{digits_found[0]}{try_op}{digits_found[1]}"))
 
-        # ===== 策略4: 原图直接OCR =====
+        # ===== 策略4: 原图直接OCR (降权) =====
         im = Image.open(io.BytesIO(raw_image_bytes)).convert("RGB")
         W0, H0 = im.size
         im_large = im.resize((W0 * 4, H0 * 4), Image.LANCZOS)
@@ -598,9 +864,30 @@ class ArithmeticCaptchaSolverV2:
         for text in candidates:
             ans, conf, _ = self._parse_arithmetic(text)
             if ans and conf >= 0.3:
-                all_candidates.append((ans, conf, f"raw_ocr:{text!r}"))
+                all_candidates.append((ans, conf * 0.7, f"raw_ocr:{text!r}"))  # 降权30%
 
-        # ===== 最终决策: 加权投票 =====
+        # ===== 策略5: 纯特征识别 (v3新增, 不依赖OCR) =====
+        for thresh_name in ["medium", "strict"]:
+            mask = self._extract_red_mask(arr, thresh_name)
+            clean_mask = self._remove_noise_lines(mask)
+            morphed = self._morphological_clean(clean_mask)
+
+            fd1 = self._classify_digit_by_features(morphed, 22, 55)
+            fd2 = self._classify_digit_by_features(morphed, 58, 98)
+
+            if fd1 is not None and fd2 is not None:
+                op_pixel, op_pixel_conf = self._identify_operator(morphed, arr)
+                op_ocr, op_ocr_conf = self._identify_operator_ocr(morphed)
+                identified_op = op_pixel if op_pixel_conf >= op_ocr_conf else op_ocr
+
+                for try_op in ['+', '-', '×', '÷']:
+                    ans = self._compute(fd1, fd2, try_op)
+                    if ans is not None and self._is_valid_result(fd1, fd2, ans):
+                        base_conf = 0.55 if try_op == identified_op else 0.32
+                        all_candidates.append((str(ans), base_conf, f"feat_only:{fd1}{try_op}{fd2}"))
+                break  # 只要medium成功就不用strict
+
+        # ===== 最终决策: 改进的加权投票 =====
         if not all_candidates:
             logger.debug("  所有策略均失败")
             return None
@@ -609,9 +896,10 @@ class ArithmeticCaptchaSolverV2:
         vote = {}
         for ans, conf, method in all_candidates:
             if ans not in vote:
-                vote[ans] = {"total_conf": 0, "count": 0, "best_method": method, "best_conf": conf}
+                vote[ans] = {"total_conf": 0, "count": 0, "methods": set(), "best_conf": conf, "best_method": method}
             vote[ans]["total_conf"] += conf
             vote[ans]["count"] += 1
+            vote[ans]["methods"].add(method.split(":")[0])  # 记录独立策略来源
             if conf > vote[ans]["best_conf"]:
                 vote[ans]["best_conf"] = conf
                 vote[ans]["best_method"] = method
@@ -619,11 +907,17 @@ class ArithmeticCaptchaSolverV2:
         # 选择总置信度最高的答案
         best_ans = max(vote, key=lambda a: vote[a]["total_conf"])
         v = vote[best_ans]
-        
-        # 多策略一致则提高置信度
-        final_conf = min(v["best_conf"] * (1 + 0.1 * v["count"]), 0.95)
-        
-        logger.debug(f"  投票结果: {dict((k, round(v['total_conf'],2)) for k, v in vote.items())} -> {best_ans}")
+
+        # 多策略一致则大幅提高置信度 (关键改进!)
+        n_strategies = len(v["methods"])  # 不同独立策略的数量
+        strategy_bonus = min(0.15 * (n_strategies - 1), 0.40)  # 每个额外独立策略+0.15
+
+        final_conf = min(
+            v["best_conf"] + strategy_bonus,
+            0.97
+        )
+
+        logger.debug(f"  投票结果: {dict((k, round(val['total_conf'],2)) for k,val in vote.items())} -> {best_ans} (策略数={n_strategies})")
 
         # 生成候选答案列表 (按总置信度降序)
         sorted_answers = sorted(vote.keys(), key=lambda a: vote[a]["total_conf"], reverse=True)
