@@ -48,7 +48,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
-log = logging.getLogger("auto_check")
+log = logging.getLogger("sap_mrp_log")
 
 
 # ============================================================
