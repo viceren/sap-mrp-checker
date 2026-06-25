@@ -887,9 +887,41 @@ class ArithmeticCaptchaSolverV2:
                         all_candidates.append((str(ans), base_conf, f"feat_only:{fd1}{try_op}{fd2}"))
                 break  # 只要medium成功就不用strict
 
+        # ===== P0改进: 候选过滤与降权 (2026-06-25, 基于50样本真实登录验证) =====
+        # 数据: 总体准确率22%, fixed_pos_morph仅7%, 0.80-0.90区间0%, 0答案准确率约13%
+        filtered = []
+        for ans, conf, method in all_candidates:
+            method_prefix = method.split(":")[0] if ":" in method else method
+            method_base = method_prefix.split("(")[0]  # "red_clean_ocr(medium)" -> "red_clean_ocr"
+
+            # 规则1: fixed_pos_morph 的 "0" 答案直接丢弃 ("0陷阱", 几乎全是误判)
+            if ans == "0" and method_base == "fixed_pos_morph":
+                continue
+
+            # 规则2: fixed_pos_morph 整体大幅降权 (准确率仅7%)
+            if method_base == "fixed_pos_morph":
+                conf *= 0.3
+
+            # 规则3: OCR原文字母占比过高时降权 (噪声污染, 如'8t1x'->9)
+            ocr_match = re.search(r"'([^']*)'", method)
+            if ocr_match and method_base in ("raw_ocr", "red_clean_ocr", "segment_ocr"):
+                ocr_text = ocr_match.group(1)
+                if len(ocr_text) > 0:
+                    letter_ratio = sum(1 for c in ocr_text if c.isalpha()) / len(ocr_text)
+                    if letter_ratio > 0.4:
+                        conf *= 0.5  # 字母占比>40%降权50%
+
+            # 规则4: "0"答案降权 (0+N/0×N准确率仅13%, 降权后让非0答案优先)
+            if ans == "0":
+                conf *= 0.6
+
+            filtered.append((ans, conf, method))
+
+        all_candidates = filtered
+
         # ===== 最终决策: 改进的加权投票 =====
         if not all_candidates:
-            logger.debug("  所有策略均失败")
+            logger.debug("  所有策略均失败 (或被P0过滤)")
             return None
 
         # 按答案分组, 累加置信度
@@ -908,9 +940,9 @@ class ArithmeticCaptchaSolverV2:
         best_ans = max(vote, key=lambda a: vote[a]["total_conf"])
         v = vote[best_ans]
 
-        # 多策略一致则大幅提高置信度 (关键改进!)
+        # 多策略一致则提高置信度 (P0: 收紧加分, 避免错误答案置信度虚高)
         n_strategies = len(v["methods"])  # 不同独立策略的数量
-        strategy_bonus = min(0.15 * (n_strategies - 1), 0.40)  # 每个额外独立策略+0.15
+        strategy_bonus = min(0.08 * (n_strategies - 1), 0.16)  # 每个额外策略+0.08, 最高+0.16
 
         final_conf = min(
             v["best_conf"] + strategy_bonus,
@@ -932,7 +964,11 @@ class ArithmeticCaptchaSolverV2:
                 if len(candidate_list) >= 3:
                     break
 
-        if final_conf < 0.2:
+        # P0改进: 拒识阈值 0.2 → 0.50
+        # 0.50以下: 降权后的fixed_pos_morph/OCR噪声, 准确率极低
+        # 0.50-0.80: 保留(部分有用候选), 0.80+质量更高
+        if final_conf < 0.50:
+            logger.debug(f"  拒识: final_conf={final_conf:.2f} < 0.50, 返回None触发重试")
             return None
 
         return {

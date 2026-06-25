@@ -38,7 +38,7 @@ TARGET_TASK = os.environ.get("TARGET_TASK", "sap-mrp-main")
 MAX_LOGIN_RETRIES = int(os.environ.get("MAX_LOGIN_RETRIES", "20"))
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(OUT_DIR, "auto_check.log")
+LOG_FILE = os.path.join(OUT_DIR, "sap_mrp.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -339,9 +339,9 @@ def generate_report(api_data, start_date, end_date):
                 "jobType": "任务类型",
                 "startTime": "开始时间",
                 "endTime": "结束时间",
+                "result": "运行状态",
                 "runResult": "运行结果",
-                "targetResult": "运行结果",
-                "result": "运行结果",
+                "targetResult": "结果码",
                 "status": "状态",
                 "createTime": "创建时间",
             }
@@ -359,17 +359,19 @@ def generate_report(api_data, start_date, end_date):
                 if k not in shown:
                     lines.append(f"  {k}: {v}")
 
-            # 判断运行结果状态
-            result_val = ""
-            for result_key in ["runResult", "targetResult", "result", "status"]:
-                if result_key in rec:
-                    result_val = str(rec[result_key])
+            # 判断运行状态 (仅看 result/runResult/status 状态字段, 不看 targetResult 结果码)
+            # targetResult 是退出码(如40), 不是状态; result 才是真正的运行状态(如"已结束")
+            status_val = ""
+            for status_key in ["result", "runResult", "status"]:
+                if status_key in rec:
+                    status_val = str(rec[status_key])
                     break
 
-            # 判断是否异常 (非"已结束"/"成功"/"完成" 都算异常)
-            if result_val and "已结束" not in result_val and "成功" not in result_val and "完成" not in result_val:
+            # 判断是否异常: 只有状态字段明确为"已结束"/"成功"/"完成"才算正常
+            # targetResult 结果码不参与异常判断
+            if status_val and "已结束" not in status_val and "成功" not in status_val and "完成" not in status_val:
                 all_ok = False
-                lines.append(f"  *** [!] 异常状态: {result_val} ***\n")
+                lines.append(f"  *** [!] 异常状态: {status_val} ***\n")
             else:
                 lines.append("")
         else:

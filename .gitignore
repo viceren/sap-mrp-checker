@@ -1,9 +1,25 @@
+# Python
 __pycache__/
 *.pyc
+
+# 日志和截图
 *.log
 *.png
 *.jpg
+
+# 运行时生成的报告
 report_*.txt
-需求说明.txt
-.workbuddy/
+
+# 敏感信息
 .env
+需求说明.txt
+
+# 评估产物 (调试用, 不入库)
+captcha_eval_*.json
+captcha_samples/
+
+# 调试脚本
+inspect_login.py
+
+# WorkBuddy
+.workbuddy/
