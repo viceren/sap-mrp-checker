@@ -17,9 +17,11 @@ report_*.txt
 # 评估产物 (调试用, 不入库)
 captcha_eval_*.json
 captcha_samples/
+captcha_accuracy_report.md
 
 # 调试脚本
 inspect_login.py
+eval_30.py
 
 # WorkBuddy
 .workbuddy/

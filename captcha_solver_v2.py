@@ -179,6 +179,95 @@ class ArithmeticCaptchaSolverV2:
 
     # ========== 运算符识别 (核心改进) ==========
 
+    @staticmethod
+    def _extract_operator_mask(mask, x1=40, x2=72, y1=5, y2=52):
+        """裁剪运算符区域，统一供像素特征与OCR使用"""
+        h, w = mask.shape
+        rx1, rx2 = max(0, x1), min(w, x2)
+        ry1, ry2 = max(0, y1), min(h, y2)
+        return mask[ry1:ry2, rx1:rx2]
+
+    def _score_operator_pixels(self, mask):
+        """基于像素几何特征给四类运算符打分"""
+        op_mask = self._extract_operator_mask(mask, x1=42, x2=70, y1=8, y2=48)
+        if op_mask.sum() < 5:
+            return {'+': 0.0, '-': 0.0, '×': 0.0, '÷': 0.0}
+
+        rows = np.where(op_mask.any(axis=1))[0]
+        cols = np.where(op_mask.any(axis=0))[0]
+        if len(rows) == 0 or len(cols) == 0:
+            return {'+': 0.0, '-': 0.0, '×': 0.0, '÷': 0.0}
+
+        # 先裁到实际笔画边界，减少字符偏移对中心特征的影响
+        op_mask = op_mask[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+        row_proj = op_mask.sum(axis=1)
+        col_proj = op_mask.sum(axis=0)
+        total_px = float(op_mask.sum())
+        if total_px <= 0:
+            return {'+': 0.0, '-': 0.0, '×': 0.0, '÷': 0.0}
+
+        peak_row = int(np.argmax(row_proj))
+        peak_col = int(np.argmax(col_proj))
+        h_ratio = float(row_proj[peak_row]) / total_px
+        v_ratio = float(col_proj[peak_col]) / total_px
+        col_slice = op_mask[:, peak_col].astype(np.uint8)
+        longest_v_run = 0
+        current_run = 0
+        for val in col_slice:
+            if val:
+                current_run += 1
+                longest_v_run = max(longest_v_run, current_run)
+            else:
+                current_run = 0
+        v_continuity = longest_v_run / max(op_mask.shape[0], 1)
+
+        top_half = float(op_mask[:peak_row, :].sum())
+        bot_half = float(op_mask[peak_row + 1:, :].sum())
+        symmetry = 1.0 - abs(top_half - bot_half) / max(total_px, 1.0)
+
+        diag1 = float(np.trace(op_mask.astype(np.uint8)))
+        diag2 = float(np.trace(np.fliplr(op_mask).astype(np.uint8)))
+        diag_ratio = (diag1 + diag2) / max(total_px, 1.0)
+
+        labeled, n_labels = ndimage.label(op_mask)
+        top_components = 0
+        bot_components = 0
+        for lbl in range(1, n_labels + 1):
+            region = labeled == lbl
+            if region.sum() < 2:
+                continue
+            r_idx = np.where(region.any(axis=1))[0]
+            if len(r_idx) == 0:
+                continue
+            if r_idx[-1] < peak_row:
+                top_components += 1
+            elif r_idx[0] > peak_row:
+                bot_components += 1
+
+        scores = {'+': 0.0, '-': 0.0, '×': 0.0, '÷': 0.0}
+
+        # + : 横竖主干都明显，且上下相对对称
+        if h_ratio > 0.12 and v_ratio > 0.12 and v_continuity > 0.34:
+            scores['+'] += min(0.85, 0.32 + h_ratio + v_ratio + 0.20 * symmetry)
+        if diag_ratio < 0.38:
+            scores['+'] += 0.05
+        if top_components >= 1 and bot_components >= 1 and v_continuity < 0.30:
+            scores['+'] *= 0.55
+
+        # - : 横向主干明显，纵向极弱
+        if h_ratio > 0.16 and v_ratio < 0.12:
+            scores['-'] += min(0.90, 0.42 + h_ratio * 1.2 - v_ratio * 0.4)
+
+        # × : 对角线占比高，横竖主干不应太强
+        if diag_ratio > 0.45:
+            scores['×'] += min(0.90, 0.32 + diag_ratio - 0.4 * max(h_ratio, v_ratio))
+
+        # ÷ : 有中间横线，且上下存在独立点/小组件
+        if h_ratio > 0.12 and top_components >= 1 and bot_components >= 1 and v_continuity < 0.30:
+            scores['÷'] += min(0.92, 0.40 + h_ratio + 0.12 * (top_components + bot_components))
+
+        return {op: round(min(max(score, 0.0), 0.95), 4) for op, score in scores.items()}
+
     def _identify_operator(self, mask, arr):
         """
         基于像素特征识别运算符: + - × ÷
@@ -190,149 +279,90 @@ class ArithmeticCaptchaSolverV2:
         3. 交叉+斜线 → ×
         4. 横线+竖线(偏移) → ÷
         """
-        H, W = mask.shape
-        # 运算符区域
-        op_x1, op_x2 = 42, 70
-        op_y1, op_y2 = 8, 48
-        op_mask = mask[op_y1:op_y2, op_x1:op_x2]
-        
-        if op_mask.sum() < 5:
-            return None, 0
-        
-        # 分析像素分布
-        col_proj = op_mask.sum(axis=0)  # 每列
-        row_proj = op_mask.sum(axis=1)  # 每行
-        
-        # 水平中心线和垂直中心线
-        mid_row = op_mask.shape[0] // 2
-        mid_col = op_mask.shape[1] // 2
-        
-        # 统计关键特征
-        h_pixels = row_proj[mid_row] if mid_row < len(row_proj) else 0  # 水平中心行像素数
-        v_pixels = col_proj[mid_col] if mid_col < len(col_proj) else 0  # 垂直中心列像素数
-        
-        # 上下半部分像素分布
-        top_half = op_mask[:mid_row, :].sum()
-        bot_half = op_mask[mid_row:, :].sum()
-        
-        # 是否有斜线 (×号特征: 非中心行列也有较多像素)
-        diag_pixels = op_mask.sum() - h_pixels * (op_mask.shape[1] / max(col_proj.max(), 1)) - v_pixels * (op_mask.shape[0] / max(row_proj.max(), 1))
-        
-        total_px = op_mask.sum()
-        
-        # 水平连续段数量
-        h_runs = 0
-        in_run = False
-        for c in range(op_mask.shape[1]):
-            if op_mask[mid_row, c] > 0 and not in_run:
-                h_runs += 1
-                in_run = True
-            elif op_mask[mid_row, c] == 0:
-                in_run = False
-        
-        # 垂直连续段数量
-        v_runs = 0
-        in_run = False
-        for r in range(op_mask.shape[0]):
-            if op_mask[r, mid_col] > 0 and not in_run:
-                v_runs += 1
-                in_run = True
-            elif op_mask[r, mid_col] == 0:
-                in_run = False
-        
-        # 判断逻辑
-        scores = {'+': 0, '-': 0, '×': 0, '÷': 0}
-        
-        # +号: 水平+垂直都有明显像素, 上下对称
-        if h_pixels > 3 and v_pixels > 3:
-            symmetry = 1 - abs(top_half - bot_half) / max(total_px, 1)
-            scores['+'] = symmetry * (h_pixels + v_pixels) / max(total_px, 1)
-        
-        # -号: 只有水平像素, 垂直几乎无
-        if h_pixels > 3 and v_pixels <= 2:
-            scores['-'] = h_pixels / max(total_px, 1)
-        
-        # ×号: 有斜线特征, 上下都有像素但不在正中心
-        # 检查对角线方向像素
-        diag1_px = 0  # 左上→右下
-        diag2_px = 0  # 右上→左下
-        for i in range(min(op_mask.shape)):
-            if i < op_mask.shape[0] and i < op_mask.shape[1]:
-                diag1_px += op_mask[i, i]
-            r2 = op_mask.shape[0] - 1 - i
-            if 0 <= r2 < op_mask.shape[0] and i < op_mask.shape[1]:
-                diag2_px += op_mask[r2, i]
-        
-        if diag1_px > 5 and diag2_px > 5:
-            scores['×'] = (diag1_px + diag2_px) / max(total_px * 2, 1)
-        
-        # ÷号: 水平线 + 上下各一个点
-        # 特征: 有水平线, 但上下半部分各有独立的点状像素
-        if h_pixels > 3:
-            top_dots = 0
-            bot_dots = 0
-            for r in range(mid_row):
-                if op_mask[r, :].sum() > 0 and op_mask[r, :].sum() < 6:
-                    top_dots += 1
-            for r in range(mid_row, op_mask.shape[0]):
-                if op_mask[r, :].sum() > 0 and op_mask[r, :].sum() < 6:
-                    bot_dots += 1
-            if top_dots >= 1 and bot_dots >= 1 and v_pixels <= 2:
-                scores['÷'] = 0.8
-        
-        # 选择得分最高的运算符
+        scores = self._score_operator_pixels(mask)
         best_op = max(scores, key=scores.get)
         best_score = scores[best_op]
-        
+
         if best_score < 0.2:
             return None, 0
-        
-        logger.debug(f"  运算符识别: {best_op} (scores={scores}, h_px={h_pixels}, v_px={v_pixels})")
+
+        logger.debug(f"  运算符识别(pixel): {best_op} scores={scores}")
         return best_op, best_score
 
-    def _identify_operator_ocr(self, mask):
-        """OCR方式识别运算符区域"""
-        H, W = mask.shape
-        op_x1, op_x2 = 40, 72
-        op_y1, op_y2 = 5, 52
-        op_mask = mask[op_y1:op_y2, op_x1:op_x2]
-        
+    def _score_operator_ocr(self, mask):
+        """对运算符区域做多变体OCR并累计得分"""
+        op_mask = self._extract_operator_mask(mask)
         if op_mask.sum() < 5:
-            return None, 0
-        
-        img = self._mask_to_image(op_mask, scale=5)
-        img_bytes = self._image_to_bytes(img)
-        
-        results = []
-        try:
-            r1 = self.ocr_default.classification(img_bytes)
-            if r1:
-                results.append(r1)
-        except Exception:
-            pass
-        if self.ocr_beta:
-            try:
-                r2 = self.ocr_beta.classification(img_bytes)
-                if r2:
-                    results.append(r2)
-            except Exception:
-                pass
-        
+            return {'+': 0.0, '-': 0.0, '×': 0.0, '÷': 0.0}
+
         op_map = {
             '+': ['+', 't', 'T', 'f', '十', 'plus'],
             '-': ['-', '一', '_', '—', 'minus'],
             '×': ['×', 'x', 'X', '*', '✕', '✖'],
             '÷': ['÷', '/', '÷', '%'],
         }
-        
-        for text in results:
-            text = text.strip()
-            for op, aliases in op_map.items():
-                for alias in aliases:
-                    if alias in text:
-                        return op, 0.7
-        
-        return None, 0
+
+        struct = ndimage.generate_binary_structure(2, 1)
+        variants = [
+            ("raw", op_mask, 0.42),
+            ("dilate", ndimage.binary_dilation(op_mask, structure=struct), 0.34),
+            ("erode", ndimage.binary_erosion(op_mask, structure=struct), 0.24),
+        ]
+
+        scores = {'+': 0.0, '-': 0.0, '×': 0.0, '÷': 0.0}
+        for _, variant_mask, variant_weight in variants:
+            if variant_mask.sum() < 3:
+                continue
+            img = self._mask_to_image(variant_mask, scale=6)
+            img_bytes = self._image_to_bytes(img)
+            texts = self._ocr_image(img_bytes)
+            for text in texts:
+                text = text.strip()
+                if not text:
+                    continue
+                for op, aliases in op_map.items():
+                    for alias in aliases:
+                        if alias in text:
+                            bonus = 0.12 if text == alias or text == op else 0.0
+                            scores[op] += variant_weight + bonus
+                            break
+
+        return {op: round(min(score, 0.95), 4) for op, score in scores.items()}
+
+    def _identify_operator_ocr(self, mask):
+        """OCR方式识别运算符区域"""
+        scores = self._score_operator_ocr(mask)
+        best_op = max(scores, key=scores.get)
+        best_score = scores[best_op]
+        if best_score < 0.25:
+            return None, 0
+        return best_op, best_score
+
+    def _rank_operator_candidates(self, mask, arr=None):
+        """融合像素特征与多变体OCR，返回排序后的运算符候选"""
+        pixel_scores = self._score_operator_pixels(mask)
+        ocr_scores = self._score_operator_ocr(mask)
+        combined = {}
+        for op in ['+', '-', '×', '÷']:
+            combined[op] = round(
+                min(pixel_scores.get(op, 0.0) * 0.62 + ocr_scores.get(op, 0.0) * 0.55, 0.98),
+                4
+            )
+
+        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+        if not ranked or ranked[0][1] < 0.18:
+            return []
+
+        filtered = [ranked[0]]
+        top_score = ranked[0][1]
+        for op, score in ranked[1:]:
+            if score >= 0.22 and score >= top_score * 0.58:
+                filtered.append((op, score))
+            if len(filtered) >= 2:
+                break
+
+        logger.debug(f"  运算符融合排序: pixel={pixel_scores} ocr={ocr_scores} ranked={filtered}")
+        return filtered
 
     # ========== OCR ==========
 
@@ -563,6 +593,11 @@ class ArithmeticCaptchaSolverV2:
             if feat['left_d'] > 2: s += 0.15  # 左侧有
             if b > 2: s += 0.15  # 底部有圆弧
             if sv < 0.60: s += 0.15  # 不太对称
+            # 5 vs 6: 5顶部明显、底部偏圆、无洞
+            if t > m * 1.2: s += 0.10
+            if holes < 1: s += 0.10
+            # 5 vs 3: 5上部极密
+            if t > b * 1.1: s += 0.08
 
         elif digit == 6:
             # 6字形: 下部圆, 顶部可能有小钩
@@ -571,6 +606,13 @@ class ArithmeticCaptchaSolverV2:
             if feat['has_bot_iso']: s += 0.20  # 底部有封闭区域
             if holes >= 1: s += 0.15  # 有空洞
             if feat['left_d'] > feat['right_d'] * 0.5: s += 0.05
+            # 6 vs 8: 6上部更稀、整体偏小
+            if t < b * 0.9: s += 0.10
+            if feat['char_h'] < 18: s += 0.05
+            # 6 vs 5: 6底部极密
+            if b > m * 1.4: s += 0.08
+            # 6 vs 0: 6不对称
+            if sv < 0.60: s += 0.08
 
         elif digit == 7:
             # 7字形: 上横+斜线, 上密下稀
@@ -578,6 +620,12 @@ class ArithmeticCaptchaSolverV2:
             if t > b * 1.5: s += 0.30  # 明显上重下轻
             if sv < 0.40: s += 0.20  # 严重不对称
             if feat['right_d'] > feat['left_d']: s += 0.10  # 斜向右
+            # 7 vs 1: 7通常更宽、上部更密
+            if a > 0.45: s += 0.15
+            if t > m * 1.8: s += 0.10
+            # 7 vs 9: 7顶部横线明显、无封闭区
+            if holes < 1: s += 0.10
+            if not feat['has_top_iso']: s += 0.08
 
         elif digit == 8:
             # 8字形: 两个圈, 对称, 可能有2个空洞
@@ -587,6 +635,13 @@ class ArithmeticCaptchaSolverV2:
             if holes >= 1: s += 0.15  # 有空洞
             if m > t * 0.5 and m > b * 0.5: s += 0.10  # 中间连接
             if nc >= 2: s += 0.05
+            # 8 vs 3: 8左右对称、上下对称
+            if sh_ > 0.60: s += 0.12
+            if feat['left_d'] > 2 and feat['right_d'] > 2: s += 0.08
+            # 8 vs 6: 8上部密度不低
+            if t > b * 0.65: s += 0.08
+            # 8 vs 0: 8有中间细腰
+            if m < t * 0.85 and m < b * 0.85: s += 0.06
 
         elif digit == 9:
             # 9字形: 上部圆, 底部可能有小尾巴
@@ -600,21 +655,15 @@ class ArithmeticCaptchaSolverV2:
 
     # ========== 四则运算解析 ==========
 
-    def _parse_arithmetic(self, text):
-        """
-        解析OCR文本为四则运算表达式，返回 (answer, confidence, operator)
-        支持: +、-、×、÷
-        约束: 操作数为个位数(0-9)
-        """
+    @staticmethod
+    def _normalize_ocr_text(text):
+        """清理 OCR 常见误识, 统一成更适合算式解析的文本"""
         if not text:
-            return None, 0, None
-        text = text.strip()
-        logger.debug(f"  [parse] OCR原文: {text!r}")
+            return ""
 
-        # 清理常见误识
-        cleaned = text
+        cleaned = text.strip()
         replacements = [
-            # 运算符替换 (注意: t→+ 是最常见的OCR误识)
+            # 运算符替换
             ('t', '+'), ('T', '+'), ('f', '+'), ('十', '+'),
             ('一', '-'), ('_', '-'), ('—', '-'),
             ('x', '×'), ('X', '×'), ('*', '×'), ('✕', '×'), ('✖', '×'),
@@ -627,6 +676,20 @@ class ArithmeticCaptchaSolverV2:
         ]
         for wrong, right in replacements:
             cleaned = cleaned.replace(wrong, right)
+        return cleaned
+
+    def _parse_arithmetic(self, text):
+        """
+        解析OCR文本为四则运算表达式，返回 (answer, confidence, operator)
+        支持: +、-、×、÷
+        约束: 操作数为个位数(0-9)
+        """
+        if not text:
+            return None, 0, None
+        text = text.strip()
+        logger.debug(f"  [parse] OCR原文: {text!r}")
+
+        cleaned = self._normalize_ocr_text(text)
         logger.debug(f"  [parse] 清理后: {cleaned!r}")
 
         # 尝试匹配 N op N 格式 (按常见度排序: + > × > - > ÷)
@@ -666,11 +729,6 @@ class ArithmeticCaptchaSolverV2:
                     ans = self._compute(n1, n2, op)
                     if ans is not None and self._is_valid_result(n1, n2, ans):
                         return str(ans), 0.5, op
-                else:
-                    # 默认加法
-                    ans = n1 + n2
-                    if self._is_valid_result(n1, n2, ans):
-                        return str(ans), 0.4, '+'
 
         if len(all_digits) == 1:
             return str(int(all_digits[0])), 0.2, None
@@ -760,7 +818,7 @@ class ArithmeticCaptchaSolverV2:
         # ===== 策略2: 固定位置分割 + 数字OCR (核心策略) =====
         # 数字1: x≈22-55, 数字2: x≈58-98 (自适应微调)
         best_digits = None
-        for thresh_name in ["medium", "strict"]:
+        for thresh_name in ["strict", "medium"]:
             mask = self._extract_red_mask(arr, thresh_name)
             clean_mask = self._remove_noise_lines(mask)
             # 形态学预处理: 连断裂笔画、去噪点
@@ -792,30 +850,28 @@ class ArithmeticCaptchaSolverV2:
 
             if d1 is not None and d2 is not None:
                 best_digits = (d1, d2)
-                # 运算符识别 (仅用于排序候选优先级)
-                op_pixel, op_pixel_conf = self._identify_operator(morphed, arr)
-                op_ocr, op_ocr_conf = self._identify_operator_ocr(morphed)
+                op_ranked = self._rank_operator_candidates(morphed, arr)
+                if op_ranked:
+                    op_order = [op for op, _ in op_ranked]
+                else:
+                    op_order = ['+', '-', '×', '÷']
 
-                identified_op = op_pixel if op_pixel_conf >= op_ocr_conf else op_ocr
-                op_conf = max(op_pixel_conf, op_ocr_conf)
-
-                # 生成4种运算的候选, 按识别到的运算符优先
-                op_order = ['+', '-', '×', '÷']
-                if identified_op and identified_op in op_order:
-                    op_order.remove(identified_op)
-                    op_order.insert(0, identified_op)
-
-                for try_op in op_order:
+                for idx, try_op in enumerate(op_order):
                     ans = self._compute(d1, d2, try_op)
                     if ans is not None and self._is_valid_result(d1, d2, ans):
-                        conf = 0.65 if try_op == identified_op else 0.38
+                        op_score = dict(op_ranked).get(try_op, 0.0)
+                        conf = 0.42 + op_score * 0.32
+                        if idx == 0:
+                            conf += 0.08
+                        elif idx >= 1:
+                            conf -= 0.06
                         # 如果特征识别也确认了这两个数字, 额外加分
                         feat_bonus = 0.05 if (d1_feat == d1 and d2_feat == d2) else 0
                         all_candidates.append((str(ans), conf + feat_bonus, f"fixed_pos_morph:{d1}{try_op}{d2}"))
-                break  # 只要medium成功就不用strict
+                break  # 优先使用strict，成功后不再回退到更松阈值
 
         # ===== 策略3: 列投影分割 + 形态学增强 =====
-        for thresh_name in ["medium", "strict"]:
+        for thresh_name in ["strict", "medium"]:
             mask = self._extract_red_mask(arr, thresh_name)
             clean_mask = self._remove_noise_lines(mask)
             morphed = self._morphological_clean(clean_mask)  # 形态学增强
@@ -867,7 +923,7 @@ class ArithmeticCaptchaSolverV2:
                 all_candidates.append((ans, conf * 0.7, f"raw_ocr:{text!r}"))  # 降权30%
 
         # ===== 策略5: 纯特征识别 (v3新增, 不依赖OCR) =====
-        for thresh_name in ["medium", "strict"]:
+        for thresh_name in ["strict", "medium"]:
             mask = self._extract_red_mask(arr, thresh_name)
             clean_mask = self._remove_noise_lines(mask)
             morphed = self._morphological_clean(clean_mask)
@@ -875,17 +931,42 @@ class ArithmeticCaptchaSolverV2:
             fd1 = self._classify_digit_by_features(morphed, 22, 55)
             fd2 = self._classify_digit_by_features(morphed, 58, 98)
 
-            if fd1 is not None and fd2 is not None:
-                op_pixel, op_pixel_conf = self._identify_operator(morphed, arr)
-                op_ocr, op_ocr_conf = self._identify_operator_ocr(morphed)
-                identified_op = op_pixel if op_pixel_conf >= op_ocr_conf else op_ocr
+            # 给特征识别加持OCR结果：当OCR有结果时优先信任OCR
+            cd1 = self._ocr_digit(morphed, 22, 55)
+            cd2 = self._ocr_digit(morphed, 58, 98)
 
-                for try_op in ['+', '-', '×', '÷']:
-                    ans = self._compute(fd1, fd2, try_op)
-                    if ans is not None and self._is_valid_result(fd1, fd2, ans):
-                        base_conf = 0.55 if try_op == identified_op else 0.32
-                        all_candidates.append((str(ans), base_conf, f"feat_only:{fd1}{try_op}{fd2}"))
-                break  # 只要medium成功就不用strict
+            # OCR和特征识别交叉确认
+            if cd1 is not None and cd2 is not None:
+                d1, d2 = cd1, cd2
+                feat_agree = (fd1 == d1 and fd2 == d2)
+                cross_bonus = 0.18 if feat_agree else 0.06
+            elif cd1 is not None and fd2 is not None:
+                d1, d2 = cd1, fd2
+                cross_bonus = 0.05 if fd1 == d1 else 0.0
+            elif fd1 is not None and cd2 is not None:
+                d1, d2 = fd1, cd2
+                cross_bonus = 0.05 if fd2 == d2 else 0.0
+            elif fd1 is not None and fd2 is not None:
+                if thresh_name != "strict":
+                    continue
+                d1, d2 = fd1, fd2
+                cross_bonus = -0.10
+            else:
+                continue
+
+            op_ranked = self._rank_operator_candidates(morphed, arr)
+            op_order = [op for op, _ in op_ranked] if op_ranked else ['+', '-', '×', '÷']
+            for idx, try_op in enumerate(op_order):
+                ans = self._compute(d1, d2, try_op)
+                if ans is not None and self._is_valid_result(d1, d2, ans):
+                    op_score = dict(op_ranked).get(try_op, 0.0)
+                    base_conf = 0.38 + op_score * 0.28 + cross_bonus
+                    if idx == 0:
+                        base_conf += 0.08
+                    elif idx >= 1:
+                        base_conf -= 0.05
+                    all_candidates.append((str(ans), base_conf, f"feat_only:{d1}{try_op}{d2}"))
+            break  # 优先使用strict，成功后不再回退到更松阈值
 
         # ===== P0改进: 候选过滤与降权 (2026-06-25, 基于50样本真实登录验证) =====
         # 数据: 总体准确率22%, fixed_pos_morph仅7%, 0.80-0.90区间0%, 0答案准确率约13%
@@ -893,6 +974,9 @@ class ArithmeticCaptchaSolverV2:
         for ans, conf, method in all_candidates:
             method_prefix = method.split(":")[0] if ":" in method else method
             method_base = method_prefix.split("(")[0]  # "red_clean_ocr(medium)" -> "red_clean_ocr"
+            method_variant = ""
+            if "(" in method_prefix and ")" in method_prefix:
+                method_variant = method_prefix.split("(", 1)[1].split(")", 1)[0]
 
             # 规则1: fixed_pos_morph 的 "0" 答案直接丢弃 ("0陷阱", 几乎全是误判)
             if ans == "0" and method_base == "fixed_pos_morph":
@@ -902,6 +986,22 @@ class ArithmeticCaptchaSolverV2:
             if method_base == "fixed_pos_morph":
                 conf *= 0.3
 
+            # 规则2.5: 按真实准确率对不同OCR来源做基础重加权
+            # strict 历史表现最好，raw/binary/segment 较差，medium 保守处理
+            if method_base == "red_clean_ocr":
+                if method_variant == "strict":
+                    conf *= 1.18
+                elif method_variant == "loose":
+                    conf *= 1.05
+                elif method_variant == "medium":
+                    conf *= 0.88
+            elif method_base == "raw_ocr":
+                conf *= 0.55
+            elif method_base == "binary_ocr":
+                conf *= 0.60
+            elif method_base == "segment_ocr":
+                conf *= 0.65
+
             # 规则3: OCR原文字母占比过高时降权 (噪声污染, 如'8t1x'->9)
             ocr_match = re.search(r"'([^']*)'", method)
             if ocr_match and method_base in ("raw_ocr", "red_clean_ocr", "segment_ocr"):
@@ -910,6 +1010,22 @@ class ArithmeticCaptchaSolverV2:
                     letter_ratio = sum(1 for c in ocr_text if c.isalpha()) / len(ocr_text)
                     if letter_ratio > 0.4:
                         conf *= 0.5  # 字母占比>40%降权50%
+
+                    cleaned_ocr = self._normalize_ocr_text(ocr_text)
+                    digit_count = len(re.findall(r'\d', cleaned_ocr))
+                    has_operator = bool(re.search(r'[+\-×÷]', cleaned_ocr))
+
+                    # "932" / "752" 这类纯数字串是 medium 阈值的主要误判来源
+                    if not has_operator and digit_count >= 2:
+                        # strict 阈值下的纯数字串仍有一定可能性正确，适度降权而不是砍掉
+                        if method_base == "red_clean_ocr" and method_variant == "strict":
+                            conf *= 0.65
+                        else:
+                            conf *= 0.40
+
+                    # 既有运算符又混入超过2个数字，通常是多余噪声字符拼接
+                    if has_operator and digit_count > 2:
+                        conf *= 0.80
 
             # 规则4: "0"答案降权 (0+N/0×N准确率仅13%, 降权后让非0答案优先)
             if ans == "0":
@@ -937,8 +1053,8 @@ class ArithmeticCaptchaSolverV2:
                 vote[ans]["best_method"] = method
 
         # 选择总置信度最高的答案
-        best_ans = max(vote, key=lambda a: vote[a]["total_conf"])
-        v = vote[best_ans]
+        ranked_vote = sorted(vote.items(), key=lambda item: item[1]["total_conf"], reverse=True)
+        best_ans, v = ranked_vote[0]
 
         # 多策略一致则提高置信度 (P0: 收紧加分, 避免错误答案置信度虚高)
         n_strategies = len(v["methods"])  # 不同独立策略的数量
@@ -950,6 +1066,17 @@ class ArithmeticCaptchaSolverV2:
         )
 
         logger.debug(f"  投票结果: {dict((k, round(val['total_conf'],2)) for k,val in vote.items())} -> {best_ans} (策略数={n_strategies})")
+
+        runner_up_total = ranked_vote[1][1]["total_conf"] if len(ranked_vote) > 1 else 0.0
+        vote_margin = v["total_conf"] - runner_up_total
+        if len(ranked_vote) > 1:
+            runner_ratio = runner_up_total / max(v["total_conf"], 1e-6)
+            # 只在"双雄僵局"时才拒识，放宽margin判断
+            if runner_ratio > 0.92 and vote_margin < 0.12 and final_conf < 0.68:
+                logger.debug(
+                    f"  拒识: best={best_ans} 与次优过近 (margin={vote_margin:.2f}, ratio={runner_ratio:.2f})"
+                )
+                return None
 
         # 生成候选答案列表 (按总置信度降序)
         sorted_answers = sorted(vote.keys(), key=lambda a: vote[a]["total_conf"], reverse=True)
@@ -964,11 +1091,9 @@ class ArithmeticCaptchaSolverV2:
                 if len(candidate_list) >= 3:
                     break
 
-        # P0改进: 拒识阈值 0.2 → 0.50
-        # 0.50以下: 降权后的fixed_pos_morph/OCR噪声, 准确率极低
-        # 0.50-0.80: 保留(部分有用候选), 0.80+质量更高
-        if final_conf < 0.50:
-            logger.debug(f"  拒识: final_conf={final_conf:.2f} < 0.50, 返回None触发重试")
+        # 拒识阈值: 0.38，过度限制会导致大量拒识浪费重试机会
+        if final_conf < 0.38:
+            logger.debug(f"  拒识: final_conf={final_conf:.2f} < 0.38, 返回None触发重试")
             return None
 
         return {
